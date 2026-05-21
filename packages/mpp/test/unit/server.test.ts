@@ -1,13 +1,35 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { InMemoryDigestStore } from './in-memory-digest-store.js';
+import type { Challenge, Credential, Method } from 'mppx';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { InMemoryDigestStore } from '../../src/in-memory-digest-store.js';
+import type { suiCharge } from '../../src/method.js';
+import {
+  type DigestStore,
+  SUI_USDC_TYPE,
+  type sui as createSuiServer,
+} from '../../src/server.js';
 
-const USDC_TYPE = '0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC';
 const RECIPIENT = '0xrecipient_address';
 const SENDER = '0xsender_address';
 
+type SuiServerMethod = Method.Server<typeof suiCharge>;
+type SuiChargeRequest = {
+  amount: string;
+  currency: string;
+  recipient: string;
+};
+type SuiChargeChallenge = Challenge.Challenge<
+  SuiChargeRequest,
+  'charge',
+  'sui'
+>;
+type SuiCredential = Credential.Credential<
+  { digest: string },
+  SuiChargeChallenge
+>;
+
 function buildMockTx({
   success = true,
-  coinType = USDC_TYPE,
+  coinType = SUI_USDC_TYPE,
   recipientAddr = RECIPIENT,
   amount = '10000',
   senderAddr = SENDER,
@@ -32,17 +54,34 @@ function buildMockTx({
     : { Transaction: undefined, FailedTransaction: txData };
 }
 
-function buildCredential(digest = '0xdigest123', amount = '0.01') {
+function buildCredential(
+  digest = '0xdigest123',
+  amount = '0.01',
+): SuiCredential {
   return {
     payload: { digest },
     challenge: {
+      id: 'test-challenge',
+      intent: 'charge',
+      method: 'sui',
+      realm: 'test',
       request: {
         amount,
-        currency: USDC_TYPE,
+        currency: SUI_USDC_TYPE,
         recipient: RECIPIENT,
       },
     },
   };
+}
+
+function verifyPayment(
+  serverMethod: SuiServerMethod,
+  credential = buildCredential(),
+) {
+  return serverMethod.verify({
+    credential,
+    request: credential.challenge.request,
+  });
 }
 
 const mockGetTransaction = vi.fn();
@@ -60,12 +99,12 @@ vi.mock('@mysten/sui/utils', () => ({
 }));
 
 describe('server verify', () => {
-  let suiFn: typeof import('./server.js').sui;
+  let suiFn: typeof createSuiServer;
   const originalEnv = process.env.NODE_ENV;
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    const mod = await import('./server.js');
+    const mod = await import('../../src/server.js');
     suiFn = mod.sui;
   });
 
@@ -77,14 +116,12 @@ describe('server verify', () => {
     mockGetTransaction.mockResolvedValue(buildMockTx());
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store: new InMemoryDigestStore(),
     });
 
-    const result = await (serverMethod as any).verify({
-      credential: buildCredential(),
-    });
+    const result = await verifyPayment(serverMethod);
 
     expect(result.reference).toBe('0xdigest123');
     expect(result.status).toBe('success');
@@ -94,14 +131,14 @@ describe('server verify', () => {
     mockGetTransaction.mockResolvedValue(buildMockTx({ success: false }));
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store: new InMemoryDigestStore(),
     });
 
-    await expect(
-      (serverMethod as any).verify({ credential: buildCredential() }),
-    ).rejects.toThrow('Transaction failed on-chain');
+    await expect(verifyPayment(serverMethod)).rejects.toThrow(
+      'Transaction failed on-chain',
+    );
   });
 
   it('rejects when payment not sent to recipient', async () => {
@@ -110,28 +147,26 @@ describe('server verify', () => {
     );
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store: new InMemoryDigestStore(),
     });
 
-    await expect(
-      (serverMethod as any).verify({ credential: buildCredential() }),
-    ).rejects.toThrow('Payment not found');
+    await expect(verifyPayment(serverMethod)).rejects.toThrow(
+      'Payment not found',
+    );
   });
 
   it('rejects when amount is less than requested', async () => {
     mockGetTransaction.mockResolvedValue(buildMockTx({ amount: '5000' }));
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store: new InMemoryDigestStore(),
     });
 
-    await expect(
-      (serverMethod as any).verify({ credential: buildCredential() }),
-    ).rejects.toThrow('Transferred');
+    await expect(verifyPayment(serverMethod)).rejects.toThrow('Transferred');
   });
 
   it('rejects when no balance changes', async () => {
@@ -144,24 +179,24 @@ describe('server verify', () => {
     });
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store: new InMemoryDigestStore(),
     });
 
-    await expect(
-      (serverMethod as any).verify({ credential: buildCredential() }),
-    ).rejects.toThrow('Payment not found');
+    await expect(verifyPayment(serverMethod)).rejects.toThrow(
+      'Payment not found',
+    );
   });
 });
 
 describe('digest replay protection', () => {
-  let suiFn: typeof import('./server.js').sui;
+  let suiFn: typeof createSuiServer;
   const originalEnv = process.env.NODE_ENV;
 
   beforeEach(async () => {
     vi.clearAllMocks();
-    const mod = await import('./server.js');
+    const mod = await import('../../src/server.js');
     suiFn = mod.sui;
   });
 
@@ -174,14 +209,12 @@ describe('digest replay protection', () => {
     mockGetTransaction.mockResolvedValue(buildMockTx());
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store,
     });
 
-    const result = await (serverMethod as any).verify({
-      credential: buildCredential(),
-    });
+    const result = await verifyPayment(serverMethod);
 
     expect(result.reference).toBe('0xdigest123');
     expect(result.status).toBe('success');
@@ -192,19 +225,15 @@ describe('digest replay protection', () => {
     mockGetTransaction.mockResolvedValue(buildMockTx());
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store,
     });
 
-    await (serverMethod as any).verify({
-      credential: buildCredential(),
-    });
+    await verifyPayment(serverMethod);
 
     await expect(
-      (serverMethod as any).verify({
-        credential: buildCredential('0xdigest123', '0.02'),
-      }),
+      verifyPayment(serverMethod, buildCredential('0xdigest123', '0.02')),
     ).rejects.toThrow('Digest already used');
   });
 
@@ -212,30 +241,29 @@ describe('digest replay protection', () => {
     const store = new InMemoryDigestStore();
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store,
     });
 
     mockGetTransaction.mockResolvedValue(buildMockTx());
-    await (serverMethod as any).verify({
-      credential: buildCredential('0xdigest123'),
-    });
+    await verifyPayment(serverMethod, buildCredential('0xdigest123'));
 
     mockGetTransaction.mockResolvedValue({
       Transaction: {
         digest: '0xdigest456',
         status: { success: true },
         balanceChanges: [
-          { coinType: USDC_TYPE, address: RECIPIENT, amount: '10000' },
-          { coinType: USDC_TYPE, address: SENDER, amount: '-10000' },
+          { coinType: SUI_USDC_TYPE, address: RECIPIENT, amount: '10000' },
+          { coinType: SUI_USDC_TYPE, address: SENDER, amount: '-10000' },
         ],
       },
     });
 
-    const result = await (serverMethod as any).verify({
-      credential: buildCredential('0xdigest456'),
-    });
+    const result = await verifyPayment(
+      serverMethod,
+      buildCredential('0xdigest456'),
+    );
 
     expect(result.reference).toBe('0xdigest456');
   });
@@ -245,27 +273,23 @@ describe('digest replay protection', () => {
     mockGetTransaction.mockResolvedValue(buildMockTx());
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store,
     });
 
-    await (serverMethod as any).verify({
-      credential: buildCredential(),
-    });
+    await verifyPayment(serverMethod);
 
     await new Promise((r) => setTimeout(r, 100));
 
-    const result = await (serverMethod as any).verify({
-      credential: buildCredential(),
-    });
+    const result = await verifyPayment(serverMethod);
     expect(result.status).toBe('success');
   });
 
   it('throws on missing store in production', () => {
     process.env.NODE_ENV = 'production';
     expect(() =>
-      suiFn({ currency: USDC_TYPE, recipient: RECIPIENT }),
+      suiFn({ currency: SUI_USDC_TYPE, recipient: RECIPIENT }),
     ).toThrow('DigestStore is required in production');
   });
 
@@ -273,18 +297,16 @@ describe('digest replay protection', () => {
     const store = {
       has: vi.fn().mockResolvedValue(false),
       set: vi.fn().mockRejectedValue(new Error('Redis down')),
-    } satisfies import('./server.js').DigestStore;
+    } satisfies DigestStore;
     mockGetTransaction.mockResolvedValue(buildMockTx());
 
     const serverMethod = suiFn({
-      currency: USDC_TYPE,
+      currency: SUI_USDC_TYPE,
       recipient: RECIPIENT,
       store,
     });
 
-    await expect(
-      (serverMethod as any).verify({ credential: buildCredential() }),
-    ).rejects.toThrow('Redis down');
+    await expect(verifyPayment(serverMethod)).rejects.toThrow('Redis down');
 
     expect(store.set).toHaveBeenCalledWith('0xdigest123');
   });
